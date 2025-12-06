@@ -1,142 +1,73 @@
-from .module import Module
+import logging
 import asyncio
-from datetime import datetime, timedelta
-import re
+from datetime import datetime
+from src.modules.module import Module
+from src.modules.parse_time import TimeParser
 
 class AlarmModule(Module):
     def __init__(self, astra_manager):
         super().__init__(astra_manager)
         self.active_alarms = []
         self.state_manager = astra_manager.get_state_manager()
+        self.event_bus = astra_manager.get_event_bus()
+        self.logger = logging.getLogger(__name__)
+        self.time_parser = TimeParser()  
+        
+    def get_name(self) -> str:
+        return "AlarmModule"
+    
+    async def on_context_cleared(self, event_data=None):
+        pass
         
     async def can_handle(self, command: str) -> bool:
         command_lower = command.lower()
         
-        # Проверяем, есть ли активный контекст установки будильника
+        # Если есть активный контекст - принимаем любую команду
         if self.state_manager.get_module_priority(self.get_name()) > 0:
-            return True
-            
-        return any(cmd in command_lower for cmd in ["будильник", "разбуди", "напомни", "таймер", "отмени", "стоп", "список", "сколько",
-                                                    "какие", "какой"])
+            if self.time_parser.parse_datetime(command)["success"]: 
+                return True
+        
+        # Без контекста принимаем только команды установки будильника
+        setup_keywords = ["будильник", "разбуди", "напомни", "таймер"]
+        return any(cmd in command_lower for cmd in setup_keywords)
     
     async def execute(self, command: str) -> str:
         command_lower = command.lower()
-        
-        # Проверяем, есть ли активный контекст для этого модуля
         has_context = self.state_manager.get_module_priority(self.get_name()) > 0
         
-        if any(cmd in command_lower for cmd in ["отмени", "удали", "стоп"]):
+        # Обработка команд отмены и показа списка
+        if any(cmd in command_lower for cmd in ["отмени", "удали", "стоп", "отмена"]):
             result = await self._cancel_alarms()
             self.state_manager.clear_active_context(self.get_name())
             return result
-        elif any(cmd in command_lower for cmd in ["список", "сколько","какие", "какой"]):
+        elif any(cmd in command_lower for cmd in ["список", "сколько", "какие", "какой", "покажи"]):
             return await self._show_alarms()
         
-        # Если есть контекст, это продолжение установки будильника
-        if has_context:
-            return await self._handle_alarm_context(command)
-        else:
-            # Новая команда установки будильника
-            return await self._set_alarm(command)
-
-    async def _handle_alarm_context(self, command: str) -> str:
-        """Обработка команды в контексте установки будильника"""
-        time_match = self._extract_time(command)
+        # Используем улучшенный парсер
+        time_result = self.time_parser.parse_datetime(command)
         
-        if not time_match:
-            # Сохраняем контекст и снова спрашиваем время
-            self.state_manager.set_active_context(self.get_name(), priority=10, timeout_seconds=60)
-            return "Не понял время. На какое время установить будильник? Например: 'на 15:30' или 'через 10 минут'"
+        if not time_result["success"]:
+            if has_context:
+                return "Не удалось распознать время. Пожалуйста, назовите время по-другому."
+            else:
+                self.state_manager.set_active_context(
+                    self.get_name(), 
+                    priority=10,
+                    context_type="alarm",
+                    timeout_seconds=60
+                )
+                return "На какое время установить будильник?"
         
+        # Устанавливаем будильник
         try:
-            alarm_time = self._parse_time(time_match)
-            await self._schedule_alarm(alarm_time)
-            # Очищаем контекст после успешной установки
+            await self._schedule_alarm(time_result["datetime"])
             self.state_manager.clear_active_context(self.get_name())
-            return f"✅ Будильник установлен на {alarm_time.strftime('%H:%M')}"
-            
-        except ValueError as e:
-            # Сохраняем контекст при ошибке
-            self.state_manager.set_active_context(self.get_name(), priority=10, timeout_seconds=60)
-            return f"Не удалось установить будильник: {str(e)}. Попробуйте еще раз."
+            return f"✅ Будильник установлен на {time_result['datetime'].strftime('%d.%m.%Y в %H:%M')}"
+        except Exception as e:
+            return f"❌ Ошибка при установке будильника: {str(e)}"
 
-    async def _set_alarm(self, command: str) -> str:
-        """Начало установки будильника"""
-        time_match = self._extract_time(command)
-        
-        if time_match:
-            # Если время указано сразу в первой команде
-            try:
-                alarm_time = self._parse_time(time_match)
-                await self._schedule_alarm(alarm_time)
-                return f"✅ Будильник установлен на {alarm_time.strftime('%H:%M')}"
-            except ValueError as e:
-                return f"Не удалось установить будильник: {str(e)}"
-        else:
-            # Устанавливаем контекст для продолжения диалога
-            self.state_manager.set_active_context(self.get_name(), priority=10, timeout_seconds=60)
-            return "На какое время установить будильник?"
-
-    def _extract_time(self, command: str) -> str:
-        """Извлекает время из команды"""
-        patterns = [
-            r'на\s+(\d+:\d+)',
-            r'в\s+(\d+:\d+)', 
-            r'на\s+(\d+)\s*(утра|вечера|ночи|дня)',
-            r'в\s+(\d+)\s*(утра|вечера|ночи|дня)',
-            r'через\s+(\d+)\s*(минут|минуты|час|часа|часов)',
-            r'(\d+:\d+)',  # Просто время без предлога
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, command.lower())
-            if match:
-                return match.group(0)
-        return None
-
-    def _parse_time(self, time_text: str) -> datetime:
-        """Парсит время из текста"""
-        now = datetime.now()
-        time_text = time_text.lower()
-        
-        # "через X минут/часов"
-        if "через" in time_text:
-            match = re.search(r'через\s+(\d+)\s*(минут|минуты|час|часа|часов)', time_text)
-            if match:
-                amount = int(match.group(1))
-                unit = match.group(2)
-                if "минут" in unit:
-                    return now + timedelta(minutes=amount)
-                else:
-                    return now + timedelta(hours=amount)
-        
-        # "на 7 утра" или "в 7 вечера"
-        match = re.search(r'(?:на|в)\s+(\d+)\s*(утра|вечера|ночи|дня)', time_text)
-        if match:
-            hour = int(match.group(1))
-            period = match.group(2)
-            if period in ["вечера", "ночи"] and hour < 12:
-                hour += 12
-            elif period == "дня" and hour < 12:
-                hour += 12
-            alarm_time = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if alarm_time <= now:
-                alarm_time += timedelta(days=1)
-            return alarm_time
-        
-        # "на 7:30" или "7:30"
-        match = re.search(r'(?:на\s+)?(\d+):(\d+)', time_text)
-        if match:
-            hour, minute = int(match.group(1)), int(match.group(2))
-            alarm_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if alarm_time <= now:
-                alarm_time += timedelta(days=1)
-            return alarm_time
-        
-        raise ValueError("Неизвестный формат времени")
-
+    # Остальные методы без изменений
     async def _schedule_alarm(self, alarm_time: datetime) -> None:
-        """Создает таймер для будильника"""
         delay = (alarm_time - datetime.now()).total_seconds()
         
         if delay > 0:
@@ -150,20 +81,17 @@ class AlarmModule(Module):
             self.active_alarms.append(alarm_info)
 
     async def _trigger_alarm(self, alarm_time: datetime, delay: float, alarm_id: str):
-        """Срабатывание будильника с оповещением"""
         try:
             await asyncio.sleep(delay)
-            await self.event_bus.emit("alarm_triggered", {
-                "message": f"Будильник на {alarm_time.strftime('%H:%M')}!"
+            await self.event_bus.publish_async("message_reminder", {
+                "message": f"⏰ Будильник на {alarm_time.strftime('%H:%M')}!"
             })
-        
         except asyncio.CancelledError:
-            print(f"Будильник {alarm_time} отменен")
+            self.logger.info(f"Будильник {alarm_time} отменен")
         finally:
             self.active_alarms = [alarm for alarm in self.active_alarms if alarm['id'] != alarm_id]
 
     async def _cancel_alarms(self) -> str:
-        """Отмена всех будильников"""
         if not self.active_alarms:
             return "Нет активных будильников"
         
@@ -177,12 +105,8 @@ class AlarmModule(Module):
         return f"✅ Отменено будильников: {cancelled}"
     
     async def _show_alarms(self) -> str:
-        """Возвразает пользователю количество будильников и на какое время они установлены"""
         if not self.active_alarms:
             return "Нет активных будильников"
         
         alarm_times = [alarm['time'].strftime("%H:%M") for alarm in self.active_alarms]
         return f"Всего будильников: {len(self.active_alarms)}. На {', '.join(alarm_times)}"
-
-    def get_name(self) -> str:
-        return "AlarmModule"
